@@ -85,12 +85,12 @@ impl AsyncRead for TcpTransport {
         }
         loop {
             std::task::ready!(self.0.poll_read_ready(cx))?;
-            match self.0.try_read(buf.initialize_unfilled()) {
+            // ReadBuf 自身实现 BufMut，Tokio 只初始化 syscall 实际写入的范围。
+            // initialize_unfilled 会先清零整个空闲区，MISS/TLS 读大正文时是
+            // 额外的内存写入；try_read_buf 已推进 filled，不能再次 advance。
+            match self.0.try_read_buf(buf) {
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                Ok(n) => {
-                    buf.advance(n);
-                    return Poll::Ready(Ok(()));
-                }
+                Ok(_) => return Poll::Ready(Ok(())),
                 Err(e) => return Poll::Ready(Err(e)),
             }
         }
@@ -1130,6 +1130,50 @@ mod tests {
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
     use tokio::sync::Notify;
+
+    #[cfg(feature = "file-send")]
+    #[tokio::test]
+    async fn shared_tcp_read_preserves_prefix_uninitialized_tail_and_eof() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut socket = TcpTransport::from(socket);
+        // 空读必须立即成功，即使对端尚未发送数据也不能等待 reactor。
+        let mut empty = [];
+        let mut empty = ReadBuf::new(&mut empty);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            std::future::poll_fn(|cx| Pin::new(&mut socket).poll_read(cx, &mut empty)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        client.write_all(b"payload").await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut backing = [std::mem::MaybeUninit::<u8>::uninit(); 64];
+        let mut buffer = ReadBuf::uninit(&mut backing);
+        buffer.put_slice(b"pre");
+        while buffer.filled().len() < 10 {
+            let before = buffer.filled().len();
+            std::future::poll_fn(|cx| Pin::new(&mut socket).poll_read(cx, &mut buffer))
+                .await
+                .unwrap();
+            assert!(buffer.filled().len() > before);
+        }
+        assert_eq!(buffer.filled(), b"prepayload");
+        assert_eq!(
+            buffer.initialized().len(),
+            10,
+            "未接收的尾部不应为网络读提前清零"
+        );
+        std::future::poll_fn(|cx| Pin::new(&mut socket).poll_read(cx, &mut buffer))
+            .await
+            .unwrap();
+        assert_eq!(buffer.filled(), b"prepayload", "EOF 不推进游标");
+    }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
