@@ -378,11 +378,13 @@ where
                             .get(http::header::CONTENT_LENGTH)
                             .and_then(|v| v.to_str().ok())
                             .and_then(|v| v.parse::<usize>().ok());
-                        file_send = session
-                            .cache
-                            .hit_handler()
-                            .file_region()
-                            .is_some_and(|r| r.len >= 128 * 1024 && Some(r.len) == length);
+                        file_send = session.cache.hit_handler().file_region().is_some_and(|r| {
+                            let eligible = r.len >= 128 * 1024 && Some(r.len) == length;
+                            if eligible {
+                                pingora_core::protocols::http::file::record_file_eligible(r.len);
+                            }
+                            eligible
+                        });
                     }
                 }
 

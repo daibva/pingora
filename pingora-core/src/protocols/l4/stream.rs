@@ -658,9 +658,11 @@ impl Stream {
         };
         let mut cancel = linux::CancelSocket::new(socket.as_fd().try_clone_to_owned()?);
         loop {
-            // Acquire capacity before submitting any work; no locks held across I/O.
+            // 提交工作前先取得有限执行额度；I/O 期间不持有业务锁。
             socket.writable().await?;
-            let Some(permit) = linux::permit() else {
+            let Ok(permit) = linux::permit().await else {
+                // Busy 只表示本轮没有拿到 syscall 槽，调用方保留精确游标，
+                // 后续继续走正常 reader；不会提交新的 blocking 任务。
                 cancel.disarm();
                 return Ok(None);
             };
@@ -668,6 +670,7 @@ impl Stream {
             let part = region.clone();
             let task = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
+                let _running = linux::Running::new();
                 socket_job.try_io(Interest::WRITABLE, || {
                     linux::step(&*socket_job, &part, part.len.min(256 * 1024))
                 })

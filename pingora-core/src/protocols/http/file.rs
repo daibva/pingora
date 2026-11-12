@@ -14,10 +14,92 @@
 
 //! Optional immutable file-body transport. No TLS or HTTP/2 raw-fd shortcut.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fs::File, io, sync::Arc};
 
-/// A read-only, immutable file region. The producer must never modify the inode
-/// after publication, including after a send completes (TCP may retransmit).
+/// 进程级固定维度计数，不以 URL/key 产生高基数指标。
+/// `eligible_bytes` 只在协议和模块检查全部通过后记录，不包含 MISS/L1/TLS。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FileSendStats {
+    pub eligible_bytes: u64,
+    pub sent_bytes: u64,
+    pub calls: u64,
+    pub wait_count: u64,
+    pub wait_ns: u64,
+    pub waiters: u64,
+    pub active: u64,
+    pub queue_full: u64,
+    pub wait_timeout: u64,
+    pub syscall_unsupported: u64,
+    pub transport_unsupported: u64,
+    pub module_disallowed: u64,
+    pub syscall_errors: u64,
+}
+
+macro_rules! counters {
+    ($($name:ident),* $(,)?) => { $(static $name: AtomicU64 = AtomicU64::new(0);)* };
+}
+counters!(
+    ELIGIBLE,
+    SENT,
+    CALLS,
+    WAIT_COUNT,
+    WAIT_NS,
+    WAITERS,
+    ACTIVE,
+    QUEUE_FULL,
+    WAIT_TIMEOUT,
+    SYSCALL_UNSUPPORTED,
+    TRANSPORT_UNSUPPORTED,
+    MODULE_DISALLOWED,
+    SYSCALL_ERRORS
+);
+
+pub fn file_send_stats() -> FileSendStats {
+    FileSendStats {
+        eligible_bytes: ELIGIBLE.load(Ordering::Relaxed),
+        sent_bytes: SENT.load(Ordering::Relaxed),
+        calls: CALLS.load(Ordering::Relaxed),
+        wait_count: WAIT_COUNT.load(Ordering::Relaxed),
+        wait_ns: WAIT_NS.load(Ordering::Relaxed),
+        waiters: WAITERS.load(Ordering::Relaxed),
+        active: ACTIVE.load(Ordering::Relaxed),
+        queue_full: QUEUE_FULL.load(Ordering::Relaxed),
+        wait_timeout: WAIT_TIMEOUT.load(Ordering::Relaxed),
+        syscall_unsupported: SYSCALL_UNSUPPORTED.load(Ordering::Relaxed),
+        transport_unsupported: TRANSPORT_UNSUPPORTED.load(Ordering::Relaxed),
+        module_disallowed: MODULE_DISALLOWED.load(Ordering::Relaxed),
+        syscall_errors: SYSCALL_ERRORS.load(Ordering::Relaxed),
+    }
+}
+
+/// 由 cache adapter 在确认完整 HIT 和精确长度后记录候选分母。
+pub fn record_file_eligible(bytes: usize) {
+    ELIGIBLE.fetch_add(bytes as u64, Ordering::Relaxed);
+}
+
+/// 分母排除不支持的 transport/module；单独记录降级原因，方便解释覆盖率。
+pub fn record_file_capability(transport: bool, modules: bool) {
+    if !transport {
+        TRANSPORT_UNSUPPORTED.fetch_add(1, Ordering::Relaxed);
+    }
+    if !modules {
+        MODULE_DISALLOWED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// 记录文件发送候选检查失败的固定原因。
+pub fn record_file_candidate_failure(transport: bool, modules: bool) {
+    record_file_capability(transport, modules);
+}
+
+/// 读取当前累计值；节点只每十秒采样一次，避免在热路径输出日志。
+pub fn stats() -> FileSendStats {
+    file_send_stats()
+}
+
+/// 只读、不可变的文件区间。发布后禁止修改 inode，即使 sendfile 已返回；
+/// TCP 发送路径仍可能因重传继续引用 page cache 页面。
 #[derive(Clone, Debug)]
 pub struct FileRegion {
     pub file: Arc<File>,
@@ -54,12 +136,112 @@ pub(crate) mod linux {
     use std::os::fd::{AsFd, OwnedFd};
     use tokio::sync::Semaphore;
 
-    // Shared across runtimes/workers. A permit stays with a running syscall even
-    // if its async waiter is cancelled. No unbounded blocking-pool submission.
-    static JOBS: Semaphore = Semaphore::const_new(1);
+    use std::time::{Duration, Instant};
 
-    pub(crate) fn permit() -> Option<tokio::sync::SemaphorePermit<'static>> {
-        JOBS.try_acquire().ok()
+    // 仍仅允许一个真正提交的文件 syscall；新增最多 32 个异步等待者，每次
+    // 等待不超过 5 ms。只有获得 jobs 才可 spawn_blocking，不占 blocking 线程排队。
+    pub(crate) struct Executor {
+        jobs: Semaphore,
+        queue: Semaphore,
+    }
+    static EXECUTOR: Executor = Executor::new();
+    #[derive(Debug, PartialEq, Eq)]
+    pub(crate) enum Busy {
+        QueueFull,
+        Timeout,
+    }
+
+    struct WaitObservation(Instant);
+    impl WaitObservation {
+        fn new() -> Self {
+            WAIT_COUNT.fetch_add(1, Ordering::Relaxed);
+            WAITERS.fetch_add(1, Ordering::Relaxed);
+            Self(Instant::now())
+        }
+    }
+    impl Drop for WaitObservation {
+        fn drop(&mut self) {
+            WAITERS.fetch_sub(1, Ordering::Relaxed);
+            WAIT_NS.fetch_add(
+                self.0.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                Ordering::Relaxed,
+            );
+        }
+    }
+    impl Executor {
+        const fn new() -> Self {
+            Self {
+                jobs: Semaphore::const_new(1),
+                queue: Semaphore::const_new(32),
+            }
+        }
+        async fn acquire(&self) -> Result<tokio::sync::SemaphorePermit<'_>, Busy> {
+            if let Ok(permit) = self.jobs.try_acquire() {
+                return Ok(permit);
+            }
+            let _queue = self.queue.try_acquire().map_err(|_| {
+                QUEUE_FULL.fetch_add(1, Ordering::Relaxed);
+                Busy::QueueFull
+            })?;
+            // RAII 覆盖正常唤醒、超时、取消三条路径；取消等待者不能泄漏队列额度。
+            let _observation = WaitObservation::new();
+            match tokio::time::timeout(Duration::from_millis(5), self.jobs.acquire()).await {
+                Ok(Ok(permit)) => Ok(permit),
+                _ => {
+                    WAIT_TIMEOUT.fetch_add(1, Ordering::Relaxed);
+                    Err(Busy::Timeout)
+                }
+            }
+        }
+    }
+    pub(crate) async fn permit() -> Result<tokio::sync::SemaphorePermit<'static>, Busy> {
+        EXECUTOR.acquire().await
+    }
+
+    // 在 blocking closure 内构造，外部 future 取消后仍由真实任务归还 active。
+    pub(crate) struct Running;
+    impl Running {
+        pub(crate) fn new() -> Self {
+            ACTIVE.fetch_add(1, Ordering::Relaxed);
+            Self
+        }
+    }
+    impl Drop for Running {
+        fn drop(&mut self) {
+            ACTIVE.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(test)]
+    mod executor_tests {
+        use super::*;
+        #[tokio::test]
+        async fn contention_waits_then_succeeds_and_cancellation_returns_capacity() {
+            let executor = Executor::new();
+            let held = executor.acquire().await.unwrap();
+            let mut waiting = Box::pin(executor.acquire());
+            assert!(futures::poll!(&mut waiting).is_pending());
+            assert_eq!(executor.queue.available_permits(), 31);
+            drop(held);
+            let permit = waiting.await.unwrap();
+            assert_eq!(executor.queue.available_permits(), 32);
+            let mut cancelled = Box::pin(executor.acquire());
+            assert!(futures::poll!(&mut cancelled).is_pending());
+            drop(cancelled);
+            assert_eq!(executor.queue.available_permits(), 32);
+            drop(permit);
+            assert!(executor.acquire().await.is_ok());
+        }
+        #[tokio::test]
+        async fn saturated_queue_and_deadline_are_bounded() {
+            let executor = Executor::new();
+            let _held = executor.acquire().await.unwrap();
+            let _all = executor.queue.acquire_many(32).await.unwrap();
+            assert_eq!(executor.acquire().await.unwrap_err(), Busy::QueueFull);
+            drop(_all);
+            assert_eq!(executor.acquire().await.unwrap_err(), Busy::Timeout);
+            assert_eq!(executor.queue.available_permits(), 32);
+        }
     }
 
     /// Owns the socket identity. Cancellation shuts it down, preventing stale
@@ -84,13 +266,32 @@ pub(crate) mod linux {
     pub(crate) fn step(socket: &impl AsFd, region: &FileRegion, count: usize) -> io::Result<usize> {
         let mut offset = i64::try_from(region.offset)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "file offset overflow"))?;
-        sendfile(
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        let result = sendfile(
             socket.as_fd(),
             region.file.as_fd(),
             Some(&mut offset),
             count,
         )
-        .map_err(|e| io::Error::from_raw_os_error(e as i32))
+        .map_err(|e| io::Error::from_raw_os_error(e as i32));
+        match &result {
+            Ok(n) => {
+                SENT.fetch_add(*n as u64, Ordering::Relaxed);
+            }
+            Err(e) if unsupported(e) => {
+                SYSCALL_UNSUPPORTED.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e)
+                if !matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                SYSCALL_ERRORS.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+        result
     }
 
     pub(crate) fn unsupported(error: &io::Error) -> bool {
