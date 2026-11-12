@@ -212,38 +212,6 @@ pub(crate) mod linux {
         }
     }
 
-    #[cfg(test)]
-    mod executor_tests {
-        use super::*;
-        #[tokio::test]
-        async fn contention_waits_then_succeeds_and_cancellation_returns_capacity() {
-            let executor = Executor::new();
-            let held = executor.acquire().await.unwrap();
-            let mut waiting = Box::pin(executor.acquire());
-            assert!(futures::poll!(&mut waiting).is_pending());
-            assert_eq!(executor.queue.available_permits(), 31);
-            drop(held);
-            let permit = waiting.await.unwrap();
-            assert_eq!(executor.queue.available_permits(), 32);
-            let mut cancelled = Box::pin(executor.acquire());
-            assert!(futures::poll!(&mut cancelled).is_pending());
-            drop(cancelled);
-            assert_eq!(executor.queue.available_permits(), 32);
-            drop(permit);
-            assert!(executor.acquire().await.is_ok());
-        }
-        #[tokio::test]
-        async fn saturated_queue_and_deadline_are_bounded() {
-            let executor = Executor::new();
-            let _held = executor.acquire().await.unwrap();
-            let _all = executor.queue.acquire_many(32).await.unwrap();
-            assert_eq!(executor.acquire().await.unwrap_err(), Busy::QueueFull);
-            drop(_all);
-            assert_eq!(executor.acquire().await.unwrap_err(), Busy::Timeout);
-            assert_eq!(executor.queue.available_permits(), 32);
-        }
-    }
-
     /// Owns the socket identity. Cancellation shuts it down, preventing stale
     /// blocking jobs from ever writing into a reused connection.
     pub(crate) struct CancelSocket(Option<OwnedFd>);
@@ -296,5 +264,39 @@ pub(crate) mod linux {
 
     pub(crate) fn unsupported(error: &io::Error) -> bool {
         matches!(error.raw_os_error(), Some(x) if x == Errno::ENOSYS as i32 || x == Errno::EINVAL as i32 || x == Errno::EOPNOTSUPP as i32)
+    }
+
+    #[cfg(test)]
+    mod executor_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn contention_waits_then_succeeds_and_cancellation_returns_capacity() {
+            let executor = Executor::new();
+            let held = executor.acquire().await.unwrap();
+            let mut waiting = Box::pin(executor.acquire());
+            assert!(futures::poll!(&mut waiting).is_pending());
+            assert_eq!(executor.queue.available_permits(), 31);
+            drop(held);
+            let permit = waiting.await.unwrap();
+            assert_eq!(executor.queue.available_permits(), 32);
+            let mut cancelled = Box::pin(executor.acquire());
+            assert!(futures::poll!(&mut cancelled).is_pending());
+            drop(cancelled);
+            assert_eq!(executor.queue.available_permits(), 32);
+            drop(permit);
+            assert!(executor.acquire().await.is_ok());
+        }
+
+        #[tokio::test]
+        async fn saturated_queue_and_deadline_are_bounded() {
+            let executor = Executor::new();
+            let _held = executor.acquire().await.unwrap();
+            let _all = executor.queue.acquire_many(32).await.unwrap();
+            assert_eq!(executor.acquire().await.unwrap_err(), Busy::QueueFull);
+            drop(_all);
+            assert_eq!(executor.acquire().await.unwrap_err(), Busy::Timeout);
+            assert_eq!(executor.queue.available_permits(), 32);
+        }
     }
 }
