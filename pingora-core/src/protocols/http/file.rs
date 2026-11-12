@@ -14,6 +14,7 @@
 
 //! Optional immutable file-body transport. No TLS or HTTP/2 raw-fd shortcut.
 
+use std::any::Any;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fs::File, io, sync::Arc};
 
@@ -100,11 +101,15 @@ pub fn stats() -> FileSendStats {
 
 /// 只读、不可变的文件区间。发布后禁止修改 inode，即使 sendfile 已返回；
 /// TCP 发送路径仍可能因重传继续引用 page cache 页面。
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct FileRegion {
     pub file: Arc<File>,
     pub offset: u64,
     pub len: usize,
+    // 由缓存 adapter 传入的 reader 租约。sendfile 任务克隆 FileRegion 时一并
+    // 持有它，直到最后一个任务释放文件引用后才归还 reader 槽。该字段不参与
+    // 文件内容或偏移语义，只负责延长底层资源生命周期。
+    pub lease: Option<Arc<dyn Any + Send + Sync>>,
 }
 
 impl FileRegion {
@@ -119,7 +124,12 @@ impl FileRegion {
                 "file region outside file",
             ));
         }
-        Ok(Self { file, offset, len })
+        Ok(Self {
+            file,
+            offset,
+            len,
+            lease: None,
+        })
     }
 }
 

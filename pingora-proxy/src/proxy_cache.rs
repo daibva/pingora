@@ -362,16 +362,25 @@ where
                 {
                     // Decide after all header filters but before committing the header.
                     // Keep Range, stale and MISS on the established byte-stream path.
-                    file_send = !header_only
+                    let transport_file = session.as_ref().supports_response_file();
+                    let module_file = session.downstream_modules_ctx.supports_response_file();
+                    let protocol_file = !header_only
                         && session.req_header().method == http::Method::GET
                         && header.status == http::StatusCode::OK
                         && matches!(range_type, RangeType::None)
                         && matches!(session.cache.phase(), pingora_cache::CachePhase::Hit)
                         && self.inner.allow_cache_file_send(session, ctx)
-                        && session.downstream_modules_ctx.supports_response_file()
-                        && session.as_ref().supports_response_file()
                         && !header.headers.contains_key(http::header::TRANSFER_ENCODING)
                         && !header.headers.contains_key(http::header::TRAILER);
+                    if protocol_file && !(transport_file && module_file) {
+                        // 只有真正进入 HIT 候选后才记录能力降级，避免把 MISS/HEAD
+                        // 等正常旁路误算成 TLS/module 不支持。
+                        pingora_core::protocols::http::file::record_file_capability(
+                            transport_file,
+                            module_file,
+                        );
+                    }
+                    file_send = protocol_file && transport_file && module_file;
                     if file_send {
                         let length = header
                             .headers

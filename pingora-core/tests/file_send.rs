@@ -85,6 +85,7 @@ async fn send(session: &mut HttpSession, region: FileRegion) {
                 file: region.file.clone(),
                 offset: region.offset + sent as u64,
                 len: region.len - sent,
+                lease: None,
             })
             .await
             .unwrap()
@@ -210,6 +211,7 @@ async fn cancelled_file_response_cannot_be_reused() {
                     file: file.clone(),
                     offset: sent as u64,
                     len: 4 * 1024 * 1024 - sent,
+                    lease: None,
                 })
                 .await
                 .unwrap()
@@ -289,6 +291,7 @@ async fn truncated_file_fails_without_reusing_connection() {
             file: file.clone(),
             offset: 0,
             len: 10,
+            lease: None,
         })
         .await
         .unwrap()
@@ -298,7 +301,8 @@ async fn truncated_file_fails_without_reusing_connection() {
         .write_response_file(FileRegion {
             file,
             offset: 5,
-            len: 5
+            len: 5,
+            lease: None,
         })
         .await
         .is_err());

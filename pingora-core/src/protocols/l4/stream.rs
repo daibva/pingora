@@ -671,9 +671,14 @@ impl Stream {
             let task = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 let _running = linux::Running::new();
-                socket_job.try_io(Interest::WRITABLE, || {
+                let result = socket_job.try_io(Interest::WRITABLE, || {
                     linux::step(&*socket_job, &part, part.len.min(256 * 1024))
-                })
+                });
+                // 先释放 FileRegion 中的文件/reader 租约，再归还执行槽。
+                // 否则最后一个文件引用的 close 可能发生在执行额度归还之后，
+                // 使取消风暴绕过单一 job 和有界 reader 的约束。
+                drop(part);
+                result
             });
             let result = task.await.map_err(std::io::Error::other)?;
             match result {
