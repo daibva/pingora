@@ -37,6 +37,10 @@ impl DerefMut for ResponseCompression {
 
 #[async_trait]
 impl HttpModule for ResponseCompression {
+    fn supports_response_file(&self) -> bool {
+        !self.0.is_enabled()
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

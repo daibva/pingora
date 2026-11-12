@@ -331,6 +331,8 @@ where
 
         // return a 416 with an empty body for simplicity
         let header_only = header_only || matches!(range_type, RangeType::Invalid);
+        #[cfg(feature = "file-send")]
+        let mut file_send;
         debug!("header: {header:?}");
 
         // TODO: use ProxyUseCache to replace the logic below
@@ -354,6 +356,34 @@ where
                         });
                     // we have not write anything dirty to downstream, it is still reusable
                     return (true, Some(e));
+                }
+
+                #[cfg(feature = "file-send")]
+                {
+                    // Decide after all header filters but before committing the header.
+                    // Keep Range, stale and MISS on the established byte-stream path.
+                    file_send = !header_only
+                        && session.req_header().method == http::Method::GET
+                        && header.status == http::StatusCode::OK
+                        && matches!(range_type, RangeType::None)
+                        && matches!(session.cache.phase(), pingora_cache::CachePhase::Hit)
+                        && self.inner.allow_cache_file_send(session, ctx)
+                        && session.downstream_modules_ctx.supports_response_file()
+                        && session.as_ref().supports_response_file()
+                        && !header.headers.contains_key(http::header::TRANSFER_ENCODING)
+                        && !header.headers.contains_key(http::header::TRAILER);
+                    if file_send {
+                        let length = header
+                            .headers
+                            .get(http::header::CONTENT_LENGTH)
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|v| v.parse::<usize>().ok());
+                        file_send = session
+                            .cache
+                            .hit_handler()
+                            .file_region()
+                            .is_some_and(|r| r.len >= 128 * 1024 && Some(r.len) == length);
+                    }
                 }
 
                 if let Err(e) = session
@@ -426,6 +456,27 @@ where
                 RangeType::None => None,
             };
             loop {
+                #[cfg(feature = "file-send")]
+                if file_send {
+                    let region = session.cache.hit_handler().file_region();
+                    if let Some(region) = region {
+                        if region.len == 0 {
+                            break;
+                        }
+                        match session.as_mut().write_response_file(region).await {
+                            Ok(Some(n)) => {
+                                if let Err(e) = session.cache.hit_handler().consume_file(n) {
+                                    return (false, Some(e));
+                                }
+                                tokio::task::yield_now().await;
+                                continue;
+                            }
+                            Ok(None) => {} // same cursor, same immutable file
+                            Err(e) => return (false, Some(e.into_down())),
+                        }
+                    }
+                    file_send = false;
+                }
                 match session.cache.hit_handler().read_body().await {
                     Ok(raw_body) => {
                         let end = raw_body.is_none();

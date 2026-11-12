@@ -61,6 +61,33 @@ pub enum Session {
 }
 
 impl Session {
+    /// Actual plaintext H1 transport capability; TLS/H2/custom never opt in.
+    #[cfg(feature = "file-send")]
+    pub fn supports_response_file(&self) -> bool {
+        matches!(self, Self::H1(s) if s.supports_response_file())
+    }
+
+    /// Bytes actually sent by the optional file transport (never buffered/TLS).
+    #[cfg(feature = "file-send")]
+    pub fn file_bytes_sent(&self) -> usize {
+        match self {
+            Self::H1(s) => s.file_bytes_sent(),
+            _ => 0,
+        }
+    }
+
+    /// Send a file quantum through the protocol-owned writer.
+    #[cfg(feature = "file-send")]
+    pub async fn write_response_file(
+        &mut self,
+        region: super::file::FileRegion,
+    ) -> Result<Option<usize>> {
+        match self {
+            Self::H1(s) => s.write_response_file(region).await,
+            _ => Ok(None),
+        }
+    }
+
     /// Create a new [`Session`] from an established connection for HTTP/1.x
     pub fn new_http1(stream: Stream) -> Self {
         Self::H1(SessionV1::new(stream))

@@ -45,9 +45,102 @@ use crate::protocols::{
 };
 use crate::upstreams::peer::Tracer;
 
+#[cfg(not(all(feature = "file-send", target_os = "linux")))]
+type TcpTransport = TcpStream;
+
+// One reactor registration shared with bounded blocking sendfile jobs. The
+// protocol still owns all writes; Arc only keeps socket identity alive on cancel.
+#[cfg(all(feature = "file-send", target_os = "linux"))]
+#[derive(Debug)]
+struct TcpTransport(Arc<TcpStream>);
+
+#[cfg(all(feature = "file-send", target_os = "linux"))]
+impl std::ops::Deref for TcpTransport {
+    type Target = TcpStream;
+    fn deref(&self) -> &TcpStream {
+        &self.0
+    }
+}
+#[cfg(all(feature = "file-send", target_os = "linux"))]
+impl From<TcpStream> for TcpTransport {
+    fn from(s: TcpStream) -> Self {
+        Self(Arc::new(s))
+    }
+}
+#[cfg(all(feature = "file-send", target_os = "linux"))]
+impl std::os::fd::AsFd for TcpTransport {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+#[cfg(all(feature = "file-send", target_os = "linux"))]
+impl AsyncRead for TcpTransport {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        loop {
+            std::task::ready!(self.0.poll_read_ready(cx))?;
+            match self.0.try_read(buf.initialize_unfilled()) {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                Ok(n) => {
+                    buf.advance(n);
+                    return Poll::Ready(Ok(()));
+                }
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
+    }
+}
+#[cfg(all(feature = "file-send", target_os = "linux"))]
+impl AsyncWrite for TcpTransport {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        loop {
+            std::task::ready!(self.0.poll_write_ready(cx))?;
+            match self.0.try_write(buf) {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                result => return Poll::Ready(result),
+            }
+        }
+    }
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(
+            nix::sys::socket::shutdown(self.as_raw_fd(), nix::sys::socket::Shutdown::Write)
+                .map_err(|e| io::Error::from_raw_os_error(e as i32)),
+        )
+    }
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        loop {
+            std::task::ready!(self.0.poll_write_ready(cx))?;
+            match self.0.try_write_vectored(bufs) {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                result => return Poll::Ready(result),
+            }
+        }
+    }
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
+}
+
 #[derive(Debug)]
 enum RawStream {
-    Tcp(TcpStream),
+    Tcp(TcpTransport),
     #[cfg(unix)]
     Unix(UnixStream),
     Virtual(virt::VirtualSocketStream),
@@ -543,6 +636,58 @@ pub struct Stream {
 }
 
 impl Stream {
+    /// Only a concrete plaintext TCP stream can use the file writer.
+    #[cfg(all(feature = "file-send", target_os = "linux"))]
+    pub(crate) fn supports_file(&self) -> bool {
+        matches!(self.stream().get_ref().stream, RawStream::Tcp(_))
+    }
+
+    /// Send one bounded quantum, with cold-file work off the network runtime.
+    /// `None` means capability/queue unavailable; caller retains exact position.
+    #[cfg(all(feature = "file-send", target_os = "linux"))]
+    pub(crate) async fn send_file(
+        &mut self,
+        region: crate::protocols::http::file::FileRegion,
+    ) -> std::io::Result<Option<usize>> {
+        use crate::protocols::http::file::linux;
+        use std::os::fd::AsFd;
+
+        self.flush().await?;
+        let RawStream::Tcp(socket) = &self.stream().get_ref().stream else {
+            return Ok(None);
+        };
+        let mut cancel = linux::CancelSocket::new(socket.as_fd().try_clone_to_owned()?);
+        loop {
+            // Acquire capacity before submitting any work; no locks held across I/O.
+            socket.writable().await?;
+            let Some(permit) = linux::permit() else {
+                cancel.disarm();
+                return Ok(None);
+            };
+            let socket_job = socket.0.clone();
+            let part = region.clone();
+            let task = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                socket_job.try_io(Interest::WRITABLE, || {
+                    linux::step(&*socket_job, &part, part.len.min(256 * 1024))
+                })
+            });
+            let result = task.await.map_err(std::io::Error::other)?;
+            match result {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) if linux::unsupported(&e) => {
+                    cancel.disarm();
+                    return Ok(None);
+                }
+                other => {
+                    cancel.disarm();
+                    return other.map(Some);
+                }
+            }
+        }
+    }
+
     fn stream(&self) -> &BufferedStream {
         self.stream.as_ref().expect("stream should always be set")
     }
@@ -647,7 +792,7 @@ impl From<TcpStream> for Stream {
             stream: Some(BufferedStream::with_capacity(
                 0,
                 0,
-                RawStreamWrapper::new(RawStream::Tcp(s)),
+                RawStreamWrapper::new(RawStream::Tcp(s.into())),
             )),
             rewind_read_buf: Vec::new(),
             buffer_write: true,

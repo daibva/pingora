@@ -52,6 +52,14 @@ pub trait ProxyHttp {
     /// Define how the `ctx` should be created.
     fn new_ctx(&self) -> Self::CTX;
 
+    /// Explicitly opt into immutable file cache delivery without calling body,
+    /// trailer or done filters. Implementors must not depend on those callbacks
+    /// for policy, transforms, throttling or accounting. Default fails closed.
+    #[cfg(feature = "file-send")]
+    fn allow_cache_file_send(&self, _session: &Session, _ctx: &Self::CTX) -> bool {
+        false
+    }
+
     /// Define where the proxy should send the request to.
     ///
     /// The returned [HttpPeer] contains the information regarding where and how this request should

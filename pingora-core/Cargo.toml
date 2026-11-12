@@ -113,6 +113,7 @@ jemallocator = { package = "tikv-jemallocator", version = "0.6" }
 
 [features]
 default = []
+file-send = ["nix/zerocopy"]
 # Requires building with `--cfg tokio_unstable`.
 dial9 = ["pingora-runtime/dial9"]
 dial9-worker-s3 = ["dial9", "pingora-runtime/dial9-worker-s3"]

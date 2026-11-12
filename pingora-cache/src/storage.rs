@@ -253,6 +253,22 @@ pub trait Storage {
 /// Cache hit handling trait
 #[async_trait]
 pub trait HandleHit {
+    /// Optional immutable region at the current read cursor. Must not advance
+    /// until `consume_file` reports bytes actually sent. Default is buffered.
+    #[cfg(feature = "file-send")]
+    fn file_region(&self) -> Option<pingora_core::protocols::http::file::FileRegion> {
+        None
+    }
+
+    /// Advance the same cursor used by read_body after a successful file write.
+    #[cfg(feature = "file-send")]
+    fn consume_file(&mut self, _n: usize) -> Result<()> {
+        pingora_error::Error::e_explain(
+            pingora_error::ErrorType::InternalError,
+            "file cursor not supported",
+        )
+    }
+
     /// Read cached body
     ///
     /// Return `None` when no more body to read.

@@ -37,6 +37,12 @@ use std::sync::Arc;
 /// The trait an HTTP traffic module needs to implement
 #[async_trait]
 pub trait HttpModule {
+    /// Explicitly allow file bodies to bypass body/trailer/done filters.
+    /// Unknown modules fail closed. Re-evaluated after response header filters.
+    fn supports_response_file(&self) -> bool {
+        false
+    }
+
     async fn request_header_filter(&mut self, _req: &mut RequestHeader) -> Result<()> {
         Ok(())
     }
@@ -166,6 +172,11 @@ pub struct HttpModuleCtx {
 }
 
 impl HttpModuleCtx {
+    /// True only when every module explicitly permits file-body delivery.
+    pub fn supports_response_file(&self) -> bool {
+        self.module_ctx.iter().all(|m| m.supports_response_file())
+    }
+
     /// Create a placeholder empty [HttpModuleCtx].
     ///
     /// [HttpModules] should be used to create nonempty [HttpModuleCtx].

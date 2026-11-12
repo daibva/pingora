@@ -23,6 +23,8 @@ pub mod conditional_filter;
 pub mod custom;
 pub mod date;
 pub mod error_resp;
+#[cfg(feature = "file-send")]
+pub mod file;
 pub mod server;
 pub mod subrequest;
 pub mod v1;

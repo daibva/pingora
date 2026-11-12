@@ -95,6 +95,10 @@ pub struct HttpSession {
     body_write_buf: BytesMut,
     /// Track how many application (not on the wire) body bytes already sent
     body_bytes_sent: usize,
+    #[cfg(feature = "file-send")]
+    file_body_started: bool,
+    #[cfg(feature = "file-send")]
+    file_bytes_sent: usize,
     /// Track how many application (not on the wire) body bytes already read
     body_bytes_read: usize,
     /// Whether to update headers like connection, Date
@@ -190,6 +194,10 @@ impl HttpSession {
             write_timeout: None,
             total_drain_timeout: None,
             body_bytes_sent: 0,
+            #[cfg(feature = "file-send")]
+            file_body_started: false,
+            #[cfg(feature = "file-send")]
+            file_bytes_sent: 0,
             body_bytes_read: 0,
             retry_buffer: None,
             upgraded: false,
@@ -1438,6 +1446,94 @@ impl HttpSession {
             .map(|d| d.local_addr())?
     }
 
+    /// Whether the actual transport is a plaintext Linux TCP stream.
+    #[cfg(feature = "file-send")]
+    pub fn supports_response_file(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.request_header
+                .as_ref()
+                .is_some_and(|r| r.version == Version::HTTP_11)
+                && !self.upgraded
+                && self
+                    .underlying_stream
+                    .as_ref()
+                    .as_any()
+                    .downcast_ref::<crate::protocols::l4::stream::Stream>()
+                    .is_some_and(|s| s.supports_file())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
+    /// Application body bytes actually accepted by the kernel file-send path.
+    #[cfg(feature = "file-send")]
+    pub fn file_bytes_sent(&self) -> usize {
+        self.file_bytes_sent
+    }
+
+    /// Write one bounded file quantum. `None` leaves the region unconsumed so
+    /// the caller can fall back to its normal reader. Cancellation forbids reuse.
+    #[cfg(feature = "file-send")]
+    pub async fn write_response_file(
+        &mut self,
+        region: crate::protocols::http::file::FileRegion,
+    ) -> Result<Option<usize>> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = region;
+            Ok(None)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if !self.supports_response_file()
+                || !self.body_write_buf.is_empty()
+                || self.has_pending_proxy_tasks()
+                || region.len == 0
+                || self
+                    .body_writer
+                    .file_remaining()
+                    .is_none_or(|n| region.len > n)
+            {
+                return Ok(None);
+            }
+            let duration = self.write_timeout(region.len.min(256 * 1024));
+            // If this future is cancelled, this assignment remains in force.
+            let keepalive = std::mem::replace(&mut self.keepalive_timeout, KeepaliveStatus::Off);
+            self.file_body_started = true;
+            let stream = self
+                .underlying_stream
+                .as_mut()
+                .as_any_mut()
+                .downcast_mut::<crate::protocols::l4::stream::Stream>()
+                .expect("transport capability checked");
+            let operation = stream.send_file(region);
+            let result = if let Some(duration) = duration {
+                match timeout(duration, operation).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        return Error::e_explain(WriteTimedout, "file response write timed out")
+                    }
+                }
+            } else {
+                operation.await
+            };
+            let sent = result.or_err(WriteError, "sending file response")?;
+            if let Some(n) = sent {
+                if n == 0 {
+                    return Error::e_explain(WriteError, "unexpected EOF in file response");
+                }
+                self.body_writer.advance_file(n)?;
+                self.body_bytes_sent += n;
+                self.file_bytes_sent += n;
+            }
+            self.keepalive_timeout = keepalive;
+            Ok(sent)
+        }
+    }
+
     /// Consume `self`, if the connection can be reused, the underlying stream and any pipelined
     /// prefix bytes will be returned to be fed to the next [`Self::new()`]. This drains any
     /// remaining request body if it hasn't yet been read and the stream is reusable.
@@ -1448,6 +1544,10 @@ impl HttpSession {
     /// returned. If there was an error while draining any remaining request body that error will
     /// be returned.
     pub async fn reuse(mut self) -> Result<Option<ReusableHttpStream>> {
+        #[cfg(feature = "file-send")]
+        if self.file_body_started && !self.body_writer.finished() {
+            self.set_keepalive(None);
+        }
         if !self.will_keepalive() {
             debug!("HTTP shutdown connection");
             self.shutdown().await;

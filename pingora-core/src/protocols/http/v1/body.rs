@@ -1300,6 +1300,27 @@ impl BodyWriter {
         self.body_mode = BM::ContentLength(cl, 0);
     }
 
+    /// Remaining bytes suitable for an unframed file-body write.
+    #[cfg(all(feature = "file-send", target_os = "linux"))]
+    pub(crate) fn file_remaining(&self) -> Option<usize> {
+        match self.body_mode {
+            BM::ContentLength(total, written) => total.checked_sub(written),
+            _ => None,
+        }
+    }
+
+    /// Account only bytes actually accepted by sendfile, never requested bytes.
+    #[cfg(all(feature = "file-send", target_os = "linux"))]
+    pub(crate) fn advance_file(&mut self, n: usize) -> Result<()> {
+        match self.body_mode {
+            BM::ContentLength(total, written) if n <= total.saturating_sub(written) => {
+                self.body_mode = BM::ContentLength(total, written + n);
+                Ok(())
+            }
+            _ => Error::e_explain(InternalError, "file write outside Content-Length body"),
+        }
+    }
+
     pub fn convert_to_close_delimited(&mut self) {
         if matches!(self.body_mode, BodyMode::UntilClose(_)) {
             // nothing to do, already in close-delimited mode

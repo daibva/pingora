@@ -66,6 +66,7 @@ hyperlocal = "0.9"
 
 [features]
 default = []
+file-send = ["pingora-core/file-send", "pingora-cache/file-send"]
 openssl = ["pingora-core/openssl", "pingora-cache/openssl", "openssl_derived"]
 boringssl = [
     "pingora-core/boringssl",
