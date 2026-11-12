@@ -146,15 +146,17 @@ pub(crate) mod linux {
     use std::os::fd::{AsFd, OwnedFd};
     use tokio::sync::Semaphore;
 
+    use std::sync::OnceLock;
     use std::time::{Duration, Instant};
 
-    // 仍仅允许一个真正提交的文件 syscall；新增最多 32 个异步等待者，每次
-    // 等待不超过 5 ms。只有获得 jobs 才可 spawn_blocking，不占 blocking 线程排队。
+    // 发送槽在进程启动时配置，限制真正并行进入内核的 sendfile 数量；每个
+    // 请求仍只有一个写者。最多 32 个异步等待者，每次等待不超过 5 ms，
+    // 只有获得 jobs 才可 spawn_blocking，不把任务堆进 blocking pool。
     pub(crate) struct Executor {
         jobs: Semaphore,
         queue: Semaphore,
     }
-    static EXECUTOR: Executor = Executor::new();
+    static EXECUTOR: OnceLock<Executor> = OnceLock::new();
     #[derive(Debug, PartialEq, Eq)]
     pub(crate) enum Busy {
         QueueFull,
@@ -179,9 +181,9 @@ pub(crate) mod linux {
         }
     }
     impl Executor {
-        const fn new() -> Self {
+        const fn new(slots: usize) -> Self {
             Self {
-                jobs: Semaphore::const_new(1),
+                jobs: Semaphore::const_new(slots),
                 queue: Semaphore::const_new(32),
             }
         }
@@ -204,8 +206,19 @@ pub(crate) mod linux {
             }
         }
     }
+
+    /// 在创建 HTTP service 前配置进程级 sendfile 并发槽；启动后不允许热改，
+    /// 避免正在运行的请求看到不一致的资源边界。
+    pub fn configure(slots: usize) -> bool {
+        (1..=16).contains(&slots) && EXECUTOR.set(Executor::new(slots)).is_ok()
+    }
+
+    fn executor() -> &'static Executor {
+        EXECUTOR.get_or_init(|| Executor::new(1))
+    }
+
     pub(crate) async fn permit() -> Result<tokio::sync::SemaphorePermit<'static>, Busy> {
-        EXECUTOR.acquire().await
+        executor().acquire().await
     }
 
     // 在 blocking closure 内构造，外部 future 取消后仍由真实任务归还 active。
@@ -282,7 +295,7 @@ pub(crate) mod linux {
 
         #[tokio::test]
         async fn contention_waits_then_succeeds_and_cancellation_returns_capacity() {
-            let executor = Executor::new();
+            let executor = Executor::new(1);
             let held = executor.acquire().await.unwrap();
             let mut waiting = Box::pin(executor.acquire());
             assert!(futures::poll!(&mut waiting).is_pending());
@@ -300,7 +313,7 @@ pub(crate) mod linux {
 
         #[tokio::test]
         async fn saturated_queue_and_deadline_are_bounded() {
-            let executor = Executor::new();
+            let executor = Executor::new(1);
             let _held = executor.acquire().await.unwrap();
             let _all = executor.queue.acquire_many(32).await.unwrap();
             assert_eq!(executor.acquire().await.unwrap_err(), Busy::QueueFull);
@@ -309,4 +322,10 @@ pub(crate) mod linux {
             assert_eq!(executor.queue.available_permits(), 32);
         }
     }
+}
+
+/// 配置进程级 sendfile 并发槽；必须在创建 HTTP service 前调用。
+#[cfg(target_os = "linux")]
+pub fn configure(slots: usize) -> bool {
+    linux::configure(slots)
 }
