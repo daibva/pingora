@@ -90,7 +90,7 @@ async fn send(session: &mut HttpSession, region: FileRegion) {
             .await
             .unwrap()
             .expect("plaintext Linux TCP should support sendfile");
-        assert!(n > 0 && n <= 256 * 1024);
+        assert!(n > 0 && n <= pingora_core::protocols::http::file::FILE_SEND_QUANTUM);
         sent += n;
     }
     session.finish_body().await.unwrap();
@@ -228,7 +228,8 @@ async fn cancelled_file_response_cannot_be_reused() {
 
 #[tokio::test]
 async fn partial_file_then_buffered_suffix_preserves_length_and_order() {
-    let body = vec![42; 600_001];
+    let length = 2 * 1024 * 1024 + 37;
+    let body: Vec<_> = (0..length).map(|i| (i % 251) as u8).collect();
     let object = Object::new(&body);
     let file = object.open();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -240,20 +241,23 @@ async fn partial_file_then_buffered_suffix_preserves_length_and_order() {
         let mut session = HttpSession::new(Box::new(Stream::from(socket)));
         session.read_request().await.unwrap().unwrap();
         let mut header = ResponseHeader::build(200, None).unwrap();
-        header.insert_header("content-length", "600001").unwrap();
+        header
+            .insert_header("content-length", length.to_string())
+            .unwrap();
         session
             .write_response_header(Box::new(header))
             .await
             .unwrap();
         let n = session
-            .write_response_file(FileRegion::new(file, 0, 600_001).unwrap())
+            .write_response_file(FileRegion::new(file, 0, length).unwrap())
             .await
             .unwrap()
             .unwrap();
-        assert!(n > 0 && n < 600_001);
-        session.write_body(&vec![42; 600_001 - n]).await.unwrap();
+        assert!(n > 0 && n <= pingora_core::protocols::http::file::FILE_SEND_QUANTUM);
+        let suffix: Vec<_> = (n..length).map(|i| (i % 251) as u8).collect();
+        session.write_body(&suffix).await.unwrap();
         session.finish_body().await.unwrap();
-        assert_eq!(session.body_bytes_sent(), 600_001);
+        assert_eq!(session.body_bytes_sent(), length);
         assert_eq!(session.file_bytes_sent(), n);
         assert!(session.reuse().await.unwrap().is_some());
     });
@@ -307,4 +311,89 @@ async fn truncated_file_fails_without_reusing_connection() {
         .await
         .is_err());
     assert!(session.reuse().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn slow_socket_releases_slot_and_keeps_reader_lease_until_cancel() {
+    let object = Object::new(&vec![17; 4 * 1024 * 1024]);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (socket, _) = listener.accept().await.unwrap();
+    nix::sys::socket::setsockopt(&socket, nix::sys::socket::sockopt::SndBuf, &4096).unwrap();
+    client
+        .write_all(b"GET / HTTP/1.1\r\nHost: test\r\n\r\n")
+        .await
+        .unwrap();
+    let lease = Arc::new(());
+    let weak = Arc::downgrade(&lease);
+    let mut region = FileRegion::new(object.open(), 0, 4 * 1024 * 1024).unwrap();
+    region.lease = Some(lease);
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let mut session = HttpSession::new(Box::new(Stream::from(socket)));
+        session.read_request().await.unwrap().unwrap();
+        let mut header = ResponseHeader::build(200, None).unwrap();
+        header
+            .insert_header("content-length", region.len.to_string())
+            .unwrap();
+        session
+            .write_response_header(Box::new(header))
+            .await
+            .unwrap();
+        let _ = started.send(());
+        loop {
+            let n = session
+                .write_response_file(region.clone())
+                .await
+                .unwrap()
+                .unwrap();
+            region.offset += n as u64;
+            region.len -= n;
+            if region.len == 0 {
+                break;
+            }
+        }
+    });
+    ready.await.unwrap();
+    // 客户端故意不读取，发送最终应停在 writable 等待，而不是持槽等待网络。
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!task.is_finished());
+    assert!(weak.upgrade().is_some());
+    // 另一条正常连接必须还能拿到槽并完成，避免测试依赖全局指标快照。
+    let mut fast = TcpStream::connect(listener.local_addr().unwrap())
+        .await
+        .unwrap();
+    let (socket, _) = listener.accept().await.unwrap();
+    let fast_server = tokio::spawn(async move {
+        let mut session = HttpSession::new(Box::new(Stream::from(socket)));
+        session.read_request().await.unwrap().unwrap();
+        send(&mut session, FileRegion::new(object.open(), 0, 7).unwrap()).await;
+    });
+    fast.write_all(b"GET / HTTP/1.1\r\nHost: test\r\n\r\n")
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), response(&mut fast))
+            .await
+            .unwrap(),
+        vec![17; 7]
+    );
+    fast_server.await.unwrap();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    // 已运行的 blocking job 不能被 abort；最后一个租约必须随真实任务释放。
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while weak.upgrade().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut rest = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut rest))
+        .await
+        .unwrap()
+        .unwrap();
 }

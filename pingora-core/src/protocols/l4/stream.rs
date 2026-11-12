@@ -649,14 +649,13 @@ impl Stream {
         &mut self,
         region: crate::protocols::http::file::FileRegion,
     ) -> std::io::Result<Option<usize>> {
-        use crate::protocols::http::file::linux;
-        use std::os::fd::AsFd;
+        use crate::protocols::http::file::{linux, FILE_SEND_QUANTUM};
 
         self.flush().await?;
         let RawStream::Tcp(socket) = &self.stream().get_ref().stream else {
             return Ok(None);
         };
-        let mut cancel = linux::CancelSocket::new(socket.as_fd().try_clone_to_owned()?);
+        let mut cancel = linux::CancelSocket::new(socket.0.clone());
         loop {
             // 提交工作前先取得有限执行额度；I/O 期间不持有业务锁。
             socket.writable().await?;
@@ -672,7 +671,7 @@ impl Stream {
                 let _permit = permit;
                 let _running = linux::Running::new();
                 let result = socket_job.try_io(Interest::WRITABLE, || {
-                    linux::step(&*socket_job, &part, part.len.min(256 * 1024))
+                    linux::step(&*socket_job, &part, part.len.min(FILE_SEND_QUANTUM))
                 });
                 // 先释放 FileRegion 中的文件/reader 租约，再归还执行槽。
                 // 否则最后一个文件引用的 close 可能发生在执行额度归还之后，

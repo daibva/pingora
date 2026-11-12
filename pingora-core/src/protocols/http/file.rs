@@ -18,6 +18,9 @@ use std::any::Any;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fs::File, io, sync::Arc};
 
+/// 每次后台任务最多发送 1 MiB，减少小量子反复切换线程，同时保留公平边界。
+pub const FILE_SEND_QUANTUM: usize = 1024 * 1024;
+
 /// 进程级固定维度计数，不以 URL/key 产生高基数指标。
 /// `eligible_bytes` 只在协议和模块检查全部通过后记录，不包含 MISS/L1/TLS。
 #[derive(Clone, Copy, Debug, Default)]
@@ -25,6 +28,7 @@ pub struct FileSendStats {
     pub eligible_bytes: u64,
     pub sent_bytes: u64,
     pub calls: u64,
+    pub jobs: u64,
     pub wait_count: u64,
     pub wait_ns: u64,
     pub waiters: u64,
@@ -44,6 +48,7 @@ counters!(
     ELIGIBLE,
     SENT,
     CALLS,
+    JOBS,
     WAIT_COUNT,
     WAIT_NS,
     WAITERS,
@@ -61,6 +66,7 @@ pub fn file_send_stats() -> FileSendStats {
         eligible_bytes: ELIGIBLE.load(Ordering::Relaxed),
         sent_bytes: SENT.load(Ordering::Relaxed),
         calls: CALLS.load(Ordering::Relaxed),
+        jobs: JOBS.load(Ordering::Relaxed),
         wait_count: WAIT_COUNT.load(Ordering::Relaxed),
         wait_ns: WAIT_NS.load(Ordering::Relaxed),
         waiters: WAITERS.load(Ordering::Relaxed),
@@ -143,15 +149,16 @@ pub(crate) mod linux {
             socket::{shutdown, Shutdown},
         },
     };
-    use std::os::fd::{AsFd, OwnedFd};
+    use std::os::fd::AsFd;
     use tokio::sync::Semaphore;
 
     use std::sync::OnceLock;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     // 发送槽在进程启动时配置，限制真正并行进入内核的 sendfile 数量；每个
-    // 请求仍只有一个写者。最多 32 个异步等待者，每次等待不超过 5 ms，
-    // 只有获得 jobs 才可 spawn_blocking，不把任务堆进 blocking pool。
+    // 请求仍只有一个写者。最多 32 个异步等待者；由 HTTP 写超时兜底，不再
+    // 因单核调度超过 5 ms 就永久失去文件路径。只有获得 jobs 才可提交后台
+    // 工作，不把任务堆进 blocking pool，慢客户端也不占槽等网络可写。
     pub(crate) struct Executor {
         jobs: Semaphore,
         queue: Semaphore,
@@ -160,7 +167,6 @@ pub(crate) mod linux {
     #[derive(Debug, PartialEq, Eq)]
     pub(crate) enum Busy {
         QueueFull,
-        Timeout,
     }
 
     struct WaitObservation(Instant);
@@ -197,13 +203,9 @@ pub(crate) mod linux {
             })?;
             // RAII 覆盖正常唤醒、超时、取消三条路径；取消等待者不能泄漏队列额度。
             let _observation = WaitObservation::new();
-            match tokio::time::timeout(Duration::from_millis(5), self.jobs.acquire()).await {
-                Ok(Ok(permit)) => Ok(permit),
-                _ => {
-                    WAIT_TIMEOUT.fetch_add(1, Ordering::Relaxed);
-                    Err(Busy::Timeout)
-                }
-            }
+            // 取消时 Tokio 负责撤销等待；queue 与 observation 的 RAII 一并归还。
+            // jobs 不会 close，因此这里不需要额外的永久降级分支。
+            Ok(self.jobs.acquire().await.expect("文件执行器不会关闭"))
         }
     }
 
@@ -225,6 +227,7 @@ pub(crate) mod linux {
     pub(crate) struct Running;
     impl Running {
         pub(crate) fn new() -> Self {
+            JOBS.fetch_add(1, Ordering::Relaxed);
             ACTIVE.fetch_add(1, Ordering::Relaxed);
             Self
         }
@@ -235,12 +238,12 @@ pub(crate) mod linux {
         }
     }
 
-    /// Owns the socket identity. Cancellation shuts it down, preventing stale
-    /// blocking jobs from ever writing into a reused connection.
-    pub(crate) struct CancelSocket(Option<OwnedFd>);
+    /// 保留同一个 reactor socket 的身份。取消时 shutdown，使尚未返回的后台
+    /// 任务不能写入下一条 keepalive 响应；Arc 避免每量子 dup/close 一个 FD。
+    pub(crate) struct CancelSocket(Option<Arc<tokio::net::TcpStream>>);
     impl CancelSocket {
-        pub(crate) fn new(fd: OwnedFd) -> Self {
-            Self(Some(fd))
+        pub(crate) fn new(socket: Arc<tokio::net::TcpStream>) -> Self {
+            Self(Some(socket))
         }
         pub(crate) fn disarm(&mut self) {
             self.0.take();
@@ -248,8 +251,8 @@ pub(crate) mod linux {
     }
     impl Drop for CancelSocket {
         fn drop(&mut self) {
-            if let Some(fd) = &self.0 {
-                let _ = shutdown(std::os::fd::AsRawFd::as_raw_fd(fd), Shutdown::Both);
+            if let Some(socket) = &self.0 {
+                let _ = shutdown(std::os::fd::AsRawFd::as_raw_fd(&**socket), Shutdown::Both);
             }
         }
     }
@@ -312,14 +315,36 @@ pub(crate) mod linux {
         }
 
         #[tokio::test]
-        async fn saturated_queue_and_deadline_are_bounded() {
+        async fn saturated_queue_is_bounded_without_micro_timeout() {
             let executor = Executor::new(1);
             let _held = executor.acquire().await.unwrap();
             let _all = executor.queue.acquire_many(32).await.unwrap();
             assert_eq!(executor.acquire().await.unwrap_err(), Busy::QueueFull);
             drop(_all);
-            assert_eq!(executor.acquire().await.unwrap_err(), Busy::Timeout);
+            let mut waiting = Box::pin(executor.acquire());
+            assert!(futures::poll!(&mut waiting).is_pending());
+            // 真实 HTTP 写超时仍在外层；单核下排队超过旧阈值不是能力丢失。
+            tokio::time::sleep(std::time::Duration::from_millis(12)).await;
+            assert!(futures::poll!(&mut waiting).is_pending());
+            drop(_held);
+            assert!(waiting.await.is_ok());
             assert_eq!(executor.queue.available_permits(), 32);
+        }
+
+        #[tokio::test]
+        async fn parallel_slots_are_independent_and_never_exceed_capacity() {
+            let executor = Executor::new(2);
+            let a = executor.acquire().await.unwrap();
+            let b = executor.acquire().await.unwrap();
+            assert_eq!(executor.jobs.available_permits(), 0);
+            let mut c = Box::pin(executor.acquire());
+            assert!(futures::poll!(&mut c).is_pending());
+            drop(a);
+            let c = c.await.unwrap();
+            assert_eq!(executor.jobs.available_permits(), 0);
+            drop(b);
+            drop(c);
+            assert_eq!(executor.jobs.available_permits(), 2);
         }
     }
 }

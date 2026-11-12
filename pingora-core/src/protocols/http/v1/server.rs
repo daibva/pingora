@@ -1499,7 +1499,11 @@ impl HttpSession {
             {
                 return Ok(None);
             }
-            let duration = self.write_timeout(region.len.min(256 * 1024));
+            let duration = self.write_timeout(
+                region
+                    .len
+                    .min(crate::protocols::http::file::FILE_SEND_QUANTUM),
+            );
             // If this future is cancelled, this assignment remains in force.
             let keepalive = std::mem::replace(&mut self.keepalive_timeout, KeepaliveStatus::Off);
             self.file_body_started = true;

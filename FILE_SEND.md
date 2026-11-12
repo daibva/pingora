@@ -30,15 +30,15 @@ buffers are flushed before a file quantum. An optional shared TCP wrapper keeps
 the original Tokio reactor registration alive for blocking jobs. No additional
 socket reactor is registered.
 
-sendfile uses an explicit input offset, accepts partial writes and yields after
-at most 256 KiB. Cold-file syscalls run on `spawn_blocking`, with a process-wide
-single-job semaphore acquired before submission and held by the job. A busy
-executor returns to the normal buffered reader at the unchanged cursor; it does
-not create an unbounded blocking submission queue. Socket readiness is waited
-asynchronously; `try_io` clears readiness only when the syscall returns EAGAIN.
+文件发送使用显式偏移，接受短发送，每次后台任务最多 1 MiB。冷文件 syscall
+仍在 `spawn_blocking` 执行；提交前申请进程级并发额度，启动时可配置 1..=16 槽。
+最多 32 个等待者异步排队，取消后归还队列额度，不在 blocking pool 无界排队。
+不再用 5 ms 的排队超时永久撤销文件能力：单核调度延迟不等于 transport 失效，
+HTTP 写超时仍兜底。队列满或平台能力不支持才按原游标回退。
+socket readiness 在异步侧等待，不占执行槽；`try_io` 仅在真实 EAGAIN 时清除就绪。
 
-Cancellation owns a duplicate socket identity and shuts down the connection;
-an in-flight job retains its socket, file and permit. H1 disables reuse around
+取消保护共享同一个 `Arc<TcpStream>` 并关闭连接，不再每个量子 dup/close FD。
+在途任务继续拥有 socket、文件、reader 租约及执行额度。H1 disables reuse around
 the await and refuses incomplete file-body reuse. This prevents a detached job
 from writing into the next keepalive response. Running file I/O is not forcibly
 abortable.
@@ -52,14 +52,15 @@ another version or another HTTP response.
 
 ## Validation
 
-`pingora-core/tests/file_send.rs` has seven passing Linux contract tests covering
+`pingora-core/tests/file_send.rs` has eight Linux contract tests covering
 bounds, module opt-in, actual file bytes, non-TCP fallback, offset/header ordering,
 unlink, keepalive, mixed file/buffered delivery, truncated-file failure and
-cancellation under socket backpressure. Run serially because this prototype deliberately allows only one
-global file syscall at a time:
+cancellation under socket backpressure. 默认未配置时仍只有一槽；串行执行合约测试
+避免并行测试互相耗尽测试执行器：
 
 ```sh
 cargo test -p pingora-core --features file-send --test file_send -- --test-threads=1
+cargo test -p pingora-core --features file-send --lib executor_tests -- --test-threads=1
 ```
 
 The consumer also has Python end-to-end tests using `--file-send`, including a
