@@ -307,6 +307,21 @@ impl BodyReader {
         buf_ref.get(self.body_buf.as_ref().unwrap())
     }
 
+    /// 仅转移已解析的上游定长正文。Partial 的后续读取从全新缓冲开始，Complete
+    /// 的超读内容已在 finish_body_buf 中独立保留；不触碰 chunked 的解析游标、
+    /// 未完成块头或 trailer。返回 Bytes 被下游克隆时也不会被下一次读取改写。
+    #[cfg(feature = "file-send")]
+    pub(super) fn take_content_length_bytes(&mut self, range: &BufRef) -> Option<Bytes> {
+        if !self.upstream || !matches!(self.body_state, PS::Partial(..) | PS::Complete(_)) {
+            return None;
+        }
+        let buffer = self.body_buf.as_mut()?;
+        if range.0 != 0 || range.1 > buffer.len() {
+            return None;
+        }
+        Some(buffer.split_to(range.1).freeze())
+    }
+
     #[allow(dead_code)]
     pub fn get_body_overread(&self) -> Option<&[u8]> {
         self.body_buf_overread.as_deref()
@@ -2054,6 +2069,53 @@ mod tests {
 
     fn init_log() {
         let _ = env_logger::builder().is_test(true).try_init();
+    }
+
+    #[cfg(feature = "file-send")]
+    #[tokio::test]
+    async fn owned_upstream_body_keeps_allocation_and_old_chunks() {
+        let mut io = Builder::new().read(b"def").build();
+        let mut reader = BodyReader::new(true);
+        let prefix = BytesMut::from(&b"abc"[..]);
+        let pointer = prefix.as_ptr();
+        reader.init_content_length_owned(6, prefix);
+        let range = reader.read_body(&mut io).await.unwrap().unwrap();
+        let first = reader.take_content_length_bytes(&range).unwrap();
+        assert_eq!(first.as_ptr(), pointer, "正文必须来自原缓冲，而不是再复制");
+        let retained = first.clone();
+        let range = reader.read_body(&mut io).await.unwrap().unwrap();
+        let pointer = reader.get_body(&range).as_ptr();
+        let second = reader.take_content_length_bytes(&range).unwrap();
+        assert_eq!(second.as_ptr(), pointer);
+        assert_eq!(first, "abc");
+        assert_eq!(retained, "abc");
+        assert_eq!(second, "def");
+        assert!(reader.body_complete());
+        assert!(reader.read_body(&mut io).await.unwrap().is_none());
+    }
+
+    #[cfg(feature = "file-send")]
+    #[tokio::test]
+    async fn owned_upstream_body_retains_overread_and_truncation_state() {
+        let mut io = Builder::new().read(b"abcd").build();
+        let mut reader = BodyReader::new(true);
+        reader.init_content_length(3, b"");
+        let range = reader.read_body(&mut io).await.unwrap().unwrap();
+        let first = reader.take_content_length_bytes(&range).unwrap();
+        assert_eq!(first, "abc");
+        assert_eq!(reader.get_body_overread(), Some(&b"d"[..]));
+
+        let mut io = Builder::new().read(b"a").read(b"").build();
+        let mut reader = BodyReader::new(true);
+        reader.init_content_length(3, b"");
+        let range = reader.read_body(&mut io).await.unwrap().unwrap();
+        assert_eq!(reader.take_content_length_bytes(&range).unwrap(), "a");
+        assert_eq!(
+            reader.read_body(&mut io).await.unwrap_err().etype(),
+            &ConnectionClosed
+        );
+        assert_eq!(reader.body_state, ParseState::Done(1));
+        assert!(!reader.body_complete());
     }
 
     #[test]

@@ -477,13 +477,7 @@ impl HttpSession {
     /// Return `Ok(Some(ref)) after a successful read.
     /// Return `Ok(None)` if there is no more body to read.
     pub async fn read_body_ref(&mut self) -> Result<Option<&[u8]>> {
-        let result = match self.read_timeout {
-            Some(t) => match timeout(t, self.do_read_body()).await {
-                Ok(res) => res,
-                Err(_) => Error::e_explain(ReadTimedout, format!("reading body, timeout: {t:?}")),
-            },
-            None => self.do_read_body().await,
-        };
+        let result = self.read_body_range().await;
 
         result.map(|maybe_body| {
             maybe_body.map(|body_ref| {
@@ -494,10 +488,43 @@ impl HttpSession {
         })
     }
 
+    // 共享原有读超时与取消语义；正文计数由外层在成功取得正文后只增加一次。
+    async fn read_body_range(&mut self) -> Result<Option<BufRef>> {
+        match self.read_timeout {
+            Some(t) => match timeout(t, self.do_read_body()).await {
+                Ok(res) => res,
+                Err(_) => Error::e_explain(ReadTimedout, format!("reading body, timeout: {t:?}")),
+            },
+            None => self.do_read_body().await,
+        }
+    }
+
     /// Similar to [`Self::read_body_ref`] but return `Bytes` instead of a slice reference.
     pub async fn read_body_bytes(&mut self) -> Result<Option<Bytes>> {
-        let read = self.read_body_ref().await?;
-        Ok(read.map(Bytes::copy_from_slice))
+        #[cfg(feature = "file-send")]
+        let fixed_length = {
+            self.init_body_reader();
+            // 必须在解析前判断编码：chunked 解析完成也会进入 Complete，不能
+            // 仅根据解析后的状态误把块编码尾部当作定长正文移走。
+            matches!(
+                self.body_reader.body_state,
+                super::body::ParseState::Partial(..)
+            )
+        };
+        let Some(range) = self.read_body_range().await? else {
+            return Ok(None);
+        };
+        self.body_recv = self.body_recv.saturating_add(range.len());
+        #[cfg(feature = "file-send")]
+        if fixed_length {
+            if let Some(bytes) = self.body_reader.take_content_length_bytes(&range) {
+                return Ok(Some(bytes));
+            }
+        }
+        // 分块编码、close-delimited 及未开启试验 feature 时保持原复制路径。
+        Ok(Some(Bytes::copy_from_slice(
+            self.body_reader.get_body(&range),
+        )))
     }
 
     /// Upstream response body bytes received (payload only; excludes headers/framing).
@@ -964,6 +991,88 @@ mod tests_stream {
 
     fn init_log() {
         let _ = env_logger::builder().is_test(true).try_init();
+    }
+
+    #[cfg(feature = "file-send")]
+    #[tokio::test]
+    async fn owned_response_bytes_interoperate_with_ref_reads_and_reuse() {
+        let header = b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n";
+        let io = Builder::new()
+            .read(header)
+            .read(b"ab")
+            .read(b"cd")
+            .read(b"ef")
+            .build();
+        let mut session = HttpSession::new(Box::new(io));
+        session.read_response().await.unwrap();
+        session.respect_keepalive();
+        let first = session.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(session.read_body_ref().await.unwrap().unwrap(), b"cd");
+        let last = session.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(first, "ab");
+        assert_eq!(last, "ef");
+        assert_eq!(session.body_bytes_received(), 6);
+        assert!(session.read_body_bytes().await.unwrap().is_none());
+        assert!(session.reuse().await.is_some());
+    }
+
+    #[cfg(feature = "file-send")]
+    #[tokio::test]
+    async fn owned_response_bytes_do_not_hide_overread_or_truncated_body() {
+        let io = Builder::new()
+            .read(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabcEXTRA")
+            .build();
+        let mut session = HttpSession::new(Box::new(io));
+        session.read_response().await.unwrap();
+        session.respect_keepalive();
+        let body = session.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(body, "abc");
+        assert!(session.body_reader.has_bytes_overread());
+        assert!(session.reuse().await.is_none());
+        assert_eq!(body, "abc");
+
+        let io = Builder::new()
+            .read(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n")
+            .read(b"a")
+            .read(b"")
+            .build();
+        let mut session = HttpSession::new(Box::new(io));
+        session.read_response().await.unwrap();
+        session.respect_keepalive();
+        let body = session.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(body, "a");
+        assert!(session.read_body_bytes().await.is_err());
+        assert_eq!(session.body_bytes_received(), 1);
+        assert!(session.reuse().await.is_none());
+    }
+
+    #[cfg(feature = "file-send")]
+    #[tokio::test]
+    async fn owned_response_bytes_resume_after_cancelled_read() {
+        use std::time::Duration;
+        let io = Builder::new()
+            .read(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n")
+            .read(b"abc")
+            .wait(Duration::from_millis(40))
+            .read(b"def")
+            .build();
+        let mut session = HttpSession::new(Box::new(io));
+        session.read_response().await.unwrap();
+        session.respect_keepalive();
+        let first = session.read_body_bytes().await.unwrap().unwrap();
+        let retained = first.slice(1..3);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), session.read_body_bytes())
+                .await
+                .is_err()
+        );
+        assert_eq!(session.body_bytes_received(), 3);
+        let last = session.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(first, "abc");
+        assert_eq!(retained, "bc");
+        assert_eq!(last, "def");
+        assert_eq!(session.body_bytes_received(), 6);
+        assert!(session.reuse().await.is_some());
     }
 
     #[tokio::test]
